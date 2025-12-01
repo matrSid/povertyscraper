@@ -8,9 +8,20 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
 const nodeFetch = (...args) => import('node-fetch').then(m => m.default(...args)).catch(() => null);
 
 async function extractStreamWithPuppeteer(targetUrl, opts = {}) {
-  const browser = await puppeteer.launch({ 
-    headless: true, 
-    args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+  const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath();
+  
+  
+  const browser = await puppeteer.launch({
+  headless: true,
+  executablePath: execPath || undefined,
+  args: [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-gpu',
+  '--disable-dev-shm-usage',
+  '--single-process'
+  ],
+  ignoreHTTPSErrors: true
   });
   
   try {
