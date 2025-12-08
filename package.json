@@ -4,8 +4,6 @@
   "main": "index.js",
   "scripts": {
     "start": "node server.js",
-    "install": "npm install --legacy-peer-deps",
-    "build": "npm install --legacy-peer-deps",
     "postinstall": "npx @puppeteer/browsers install chrome@stable"
   },
   "keywords": [],
