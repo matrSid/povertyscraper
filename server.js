@@ -1,8 +1,17 @@
 const express = require('express');
 const puppeteer = require('puppeteer');
+const puppeteerCore = require('puppeteer-core');
+const chromium = require('chrome-aws-lambda');
 
 const app = express();
 app.use(express.json());
+const cors = require('cors');
+app.use(cors({
+  origin: '*',        // allow any frontend
+  methods: 'GET,POST',
+  allowedHeaders: 'Content-Type',
+}));
+
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
@@ -10,6 +19,36 @@ const wait = ms => new Promise(r => setTimeout(r, ms));
    Fetch text (m3u8, vtt, srt, etc.) *using Puppeteer itself*
    to avoid Cloudflare ECONNRESET
 -------------------------------------------------------- */
+async function launchBrowser() {
+  if (process.env.NODE_ENV === 'production') {
+    const execPath = await chromium.executablePath;
+    return await puppeteerCore.launch({
+      args: chromium.args.concat([
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage'
+      ]),
+      defaultViewport: chromium.defaultViewport,
+      executablePath: execPath || undefined,
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
+    });
+  } else {
+    // local dev - fall back to full puppeteer (installed locally)
+    return await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage'
+      ],
+      ignoreHTTPSErrors: true,
+    });
+  }
+}
+
+
 async function puppeteerFetch(page, url) {
   try {
     return await page.evaluate(async (targetUrl) => {
@@ -35,22 +74,9 @@ async function puppeteerFetch(page, url) {
    Main extraction logic
 -------------------------------------------------------- */
 async function extractStreamWithPuppeteer(targetUrl, opts = {}) {
-  const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath();
-
-  const browser = await puppeteer.launch({
-    headless: true,
-    executablePath: execPath || undefined,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-gpu',
-      '--disable-dev-shm-usage'
-    ],
-    ignoreHTTPSErrors: true
-  });
+  const browser = await launchBrowser();
 
   let page = null;
-
   try {
     page = await browser.newPage();
     await page.setUserAgent(
