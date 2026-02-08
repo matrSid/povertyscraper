@@ -7,26 +7,52 @@ const app = express();
 app.use(express.json());
 const cors = require('cors');
 app.use(cors({
-  origin: '*',        // allow any frontend
+  origin: '*',
   methods: 'GET,POST',
   allowedHeaders: 'Content-Type',
 }));
 
-
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
 /* -------------------------------------------------------
-   Fetch text (m3u8, vtt, srt, etc.) *using Puppeteer itself*
-   to avoid Cloudflare ECONNRESET
+   BROWSER POOLING - reuse browser instances
 -------------------------------------------------------- */
-async function launchBrowser() {
+let browserInstance = null;
+let lastUsed = Date.now();
+const BROWSER_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+
+// Close browser if idle for too long
+setInterval(() => {
+  if (browserInstance && Date.now() - lastUsed > BROWSER_TIMEOUT) {
+    browserInstance.close().catch(() => {});
+    browserInstance = null;
+    console.log('🔄 Browser closed due to inactivity');
+  }
+}, 60000);
+
+async function getBrowser() {
+  lastUsed = Date.now();
+  
+  if (browserInstance) {
+    try {
+      // Test if browser is still alive
+      await browserInstance.version();
+      return browserInstance;
+    } catch {
+      browserInstance = null;
+    }
+  }
+
   if (process.env.NODE_ENV === 'production') {
     const execPath = await chromium.executablePath;
-    return await puppeteerCore.launch({
+    browserInstance = await puppeteerCore.launch({
       args: chromium.args.concat([
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage'
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--disable-extensions'
       ]),
       defaultViewport: chromium.defaultViewport,
       executablePath: execPath || undefined,
@@ -34,20 +60,22 @@ async function launchBrowser() {
       ignoreHTTPSErrors: true,
     });
   } else {
-    // local dev - fall back to full puppeteer (installed locally)
-    return await puppeteer.launch({
+    browserInstance = await puppeteer.launch({
       headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-gpu',
-        '--disable-dev-shm-usage'
+        '--disable-dev-shm-usage',
+        '--disable-software-rasterizer',
+        '--disable-extensions'
       ],
       ignoreHTTPSErrors: true,
     });
   }
-}
 
+  return browserInstance;
+}
 
 async function puppeteerFetch(page, url) {
   try {
@@ -55,9 +83,7 @@ async function puppeteerFetch(page, url) {
       try {
         const res = await fetch(targetUrl, {
           method: "GET",
-          headers: {
-            "User-Agent": navigator.userAgent
-          }
+          headers: { "User-Agent": navigator.userAgent }
         });
         if (!res.ok) return null;
         return await res.text();
@@ -71,69 +97,75 @@ async function puppeteerFetch(page, url) {
 }
 
 /* -------------------------------------------------------
-   Main extraction logic
+   OPTIMIZED extraction logic
 -------------------------------------------------------- */
 async function extractStreamWithPuppeteer(targetUrl, opts = {}) {
-  const browser = await launchBrowser();
+  const browser = await getBrowser();
+  const page = await browser.newPage();
 
-  let page = null;
   try {
-    page = await browser.newPage();
+    // Block unnecessary resources for SPEED
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const type = req.resourceType();
+      const url = req.url();
+      
+      // Capture media URLs
+      if (/\.(m3u8|mp4|vtt|srt|ttml|dfxp)(\?|$)/i.test(url)) {
+        found.add(url);
+      }
+      
+      // Block heavy resources
+      if (['image', 'stylesheet', 'font', 'media'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36'
     );
 
     const found = new Set();
 
-    /* Capture network requests */
-    page.on('request', req => {
-      try {
-        const u = req.url();
-        if (/\.(m3u8|mp4|vtt|srt|ttml|dfxp)(\?|$)/i.test(u)) found.add(u);
-      } catch (e) {}
-    });
-
-    /* Capture responses */
+    // Capture responses
     page.on('response', async resp => {
       try {
         const u = resp.url();
-        const headers = resp.headers?.() || {};
-        const ct = (headers['content-type'] || '').toLowerCase();
+        const ct = (resp.headers()['content-type'] || '').toLowerCase();
 
         if (/\.(m3u8|mp4|vtt|srt|ttml|dfxp)(\?|$)/i.test(u)) found.add(u);
-        if (ct.includes('mpegurl') || ct.includes('vtt') || ct.includes('subrip') || ct.includes('ttml') || ct.includes('dfxp'))
+        if (ct.includes('mpegurl') || ct.includes('vtt') || ct.includes('subrip') || ct.includes('ttml') || ct.includes('dfxp')) {
           found.add(u);
-
+        }
       } catch (e) {}
     });
 
-    /* Load page */
-    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
-    await wait(opts.waitAfterLoad || 2500);
+    // Load page with REDUCED timeout and faster waitUntil
+    await page.goto(targetUrl, { 
+      waitUntil: 'domcontentloaded', // Changed from 'networkidle2' - MUCH faster
+      timeout: 30000 // Reduced from 60000
+    }).catch(() => {});
+    
+    // Reduced wait time
+    await wait(opts.waitAfterLoad || 1500); // Reduced from 2500
 
-    /* Extract video / track elements */
+    // Extract video/track elements
     try {
       const urls = await page.evaluate(() => {
         const list = [];
-        document.querySelectorAll('video, video source').forEach(el => {
-          if (el.src) list.push(el.src);
-          const attr = el.getAttribute?.('src');
-          if (attr) list.push(attr);
+        document.querySelectorAll('video, video source, track').forEach(el => {
+          const src = el.src || el.getAttribute?.('src');
+          if (src) list.push(src);
         });
-
-        document.querySelectorAll('track').forEach(t => {
-          if (t.src) list.push(t.src);
-          const attr = t.getAttribute?.('src');
-          if (attr) list.push(attr);
-        });
-
         return list;
       });
 
       urls.forEach(u => { if (u) found.add(u); });
     } catch (e) {}
 
-    /* Performance entries */
+    // Performance entries
     try {
       const perf = await page.evaluate(() => performance.getEntries().map(e => e.name));
       perf.forEach(u => {
@@ -141,58 +173,61 @@ async function extractStreamWithPuppeteer(targetUrl, opts = {}) {
       });
     } catch (e) {}
 
-    /* -------------------------------------------------------
-       Fetch m3u8 *via Puppeteer* to avoid ECONNRESET
-    -------------------------------------------------------- */
-    const before = Array.from(found);
+    // Fetch m3u8 and parse for subtitles - but only if found
+    const m3u8Urls = Array.from(found).filter(u => /\.m3u8(\?|$)/i.test(u));
 
-    for (const u of before) {
-      if (!/\.m3u8(\?|$)/i.test(u)) continue;
+    // Process m3u8s in PARALLEL for speed
+    await Promise.all(
+      m3u8Urls.map(async (u) => {
+        const text = await puppeteerFetch(page, u);
+        if (!text) return;
 
-      const text = await puppeteerFetch(page, u);
-      if (!text) continue;
+        // Combined regex for efficiency
+        const uriPattern = /URI="([^"']+\.(vtt|srt|m3u8|ttml|dfxp)[^"']*)"/gi;
+        const mediaPattern = /#EXT-X-MEDIA:[^\n]*TYPE=SUBTITLES[^\n]*URI="([^"']+)"/gi;
+        const plainPattern = /https?:\/\/[^\s"']+\.(vtt|srt|m3u8|ttml|dfxp)(\?[^\s"'<>]*)?/gi;
 
-      // Parse embedded subtitle URLs
-      const quoted = /URI="([^"']+\.(vtt|srt|m3u8|ttml|dfxp)[^"']*)"/gi;
-      let m;
-      while ((m = quoted.exec(text)) !== null) {
-        try { found.add(new URL(m[1], u).toString()); }
-        catch { found.add(m[1]); }
-      }
+        let m;
+        while ((m = uriPattern.exec(text)) !== null) {
+          try { found.add(new URL(m[1], u).toString()); }
+          catch { found.add(m[1]); }
+        }
 
-      const media = /#EXT-X-MEDIA:[^\n]*TYPE=SUBTITLES[^\n]*URI="([^"']+)"/gi;
-      while ((m = media.exec(text)) !== null) {
-        try { found.add(new URL(m[1], u).toString()); }
-        catch { found.add(m[1]); }
-      }
+        while ((m = mediaPattern.exec(text)) !== null) {
+          try { found.add(new URL(m[1], u).toString()); }
+          catch { found.add(m[1]); }
+        }
 
-      const plain = /https?:\/\/[^\s"']+\.(vtt|srt|m3u8|ttml|dfxp)(\?[^\s"'<>]*)?/gi;
-      let pm;
-      while ((pm = plain.exec(text)) !== null) found.add(pm[0]);
-    }
+        while ((m = plainPattern.exec(text)) !== null) {
+          found.add(m[0]);
+        }
+      })
+    );
 
-    await browser.close();
+    await page.close(); // Close page, keep browser alive
+
     return Array.from(found);
 
   } catch (err) {
-    try { if (browser) await browser.close(); } catch(e){}
+    await page.close().catch(() => {});
     throw err;
   }
 }
 
 /* -------------------------------------------------------
-   Categorize URLs
+   Categorize URLs - OPTIMIZED
 -------------------------------------------------------- */
 function categorizeUrls(urls) {
   const m3u8 = [];
   const mp4 = [];
   const subtitles = [];
 
-  urls.forEach(url => {
-    if (/\.m3u8(\?|$)/i.test(url)) m3u8.push(url);
-    else if (/\.mp4(\?|$)/i.test(url)) mp4.push(url);
+  // Single pass through array
+  for (const url of urls) {
+    if (url.includes('.m3u8')) m3u8.push(url);
+    else if (url.includes('.mp4')) mp4.push(url);
     else if (/\.(vtt|srt|ttml|dfxp)(\?|$)/i.test(url)) subtitles.push(url);
-  });
+  }
 
   return { m3u8, mp4, subtitles };
 }
@@ -201,7 +236,6 @@ function categorizeUrls(urls) {
    API ENDPOINTS
 -------------------------------------------------------- */
 
-/* Movies */
 app.get('/api/movie/:imdbId', async (req, res) => {
   const { imdbId } = req.params;
   const url = `https://vidrock.net/movie/${imdbId}`;
@@ -230,7 +264,6 @@ app.get('/api/movie/:imdbId', async (req, res) => {
   }
 });
 
-/* TV Shows */
 app.get('/api/tv/:imdbId/:season/:episode', async (req, res) => {
   const { imdbId, season, episode } = req.params;
   const url = `https://vidrock.net/tv/${imdbId}/${season}/${episode}`;
@@ -261,7 +294,6 @@ app.get('/api/tv/:imdbId/:season/:episode', async (req, res) => {
   }
 });
 
-/* Generic extractor */
 app.get('/api/extract', async (req, res) => {
   const { url } = req.query;
 
@@ -291,13 +323,18 @@ app.get('/api/extract', async (req, res) => {
   }
 });
 
-/* Health check */
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-/* Start server */
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, closing browser...');
+  if (browserInstance) await browserInstance.close();
+  process.exit(0);
+});
+
 const port = process.env.PORT || 9000;
 app.listen(port, () => {
-  console.log(`Vidrock Stream API running on port ${port}`);
+  console.log(`⚡ Vidrock Stream API running on port ${port}`);
 });
