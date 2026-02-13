@@ -1,5 +1,7 @@
+// server.js (updated)
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core'); // changed to puppeteer-core
+const fs = require('fs');
 const cors = require('cors');
 
 const CHROME_PATH = process.env.CHROME_PATH || null;
@@ -23,6 +25,28 @@ setInterval(() => {
   }
 }, 60000);
 
+// Try to find a system Chrome/Chromium binary if CHROME_PATH not provided
+function findChromeExecutable() {
+  if (CHROME_PATH) return CHROME_PATH;
+
+  const commonPaths = [
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/snap/bin/chromium',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'
+  ];
+
+  for (const p of commonPaths) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (e) {}
+  }
+  return null;
+}
+
 async function getBrowser() {
   lastUsed = Date.now();
 
@@ -35,23 +59,45 @@ async function getBrowser() {
     }
   }
 
-  browserInstance = await puppeteer.launch({
-    executablePath: CHROME_PATH,
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--disable-extensions'
-    ],
-    ignoreHTTPSErrors: true,
-    defaultViewport: { width: 1280, height: 720 }
-  });
+  const executablePath = findChromeExecutable();
 
-  return browserInstance;
+  if (!executablePath) {
+    // Clear guidance: don't try to let puppeteer-core download chrome; we want the host to provide it.
+    const err = new Error(
+      'No Chrome/Chromium executable found. Set CHROME_PATH to a valid system path or install chromium on the host. ' +
+      'Also set PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true to avoid package download during build.'
+    );
+    console.error(err.message);
+    throw err;
+  }
+
+  try {
+    browserInstance = await puppeteer.launch({
+      executablePath,
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--disable-extensions',
+        '--single-process',
+        '--no-zygote'
+      ],
+      ignoreHTTPSErrors: true,
+      defaultViewport: { width: 1280, height: 720 }
+    });
+    console.log('🚀 Launched Chromium from:', executablePath);
+    return browserInstance;
+  } catch (launchErr) {
+    console.error('Failed to launch Chromium:', launchErr);
+    throw launchErr;
+  }
 }
+
+// ... rest of your functions unchanged (puppeteerFetch, extractStreamWithPuppeteer, categorizeUrls)
+// I will paste them unchanged below to keep one complete file.
 
 async function puppeteerFetch(page, url) {
   try {
@@ -210,6 +256,7 @@ function categorizeUrls(urls, metadata) {
   return { m3u8, mp4, subtitles };
 }
 
+// routes (unchanged)
 app.get('/api/movie/:imdbId', async (req, res) => {
   const { imdbId } = req.params;
   const url = `https://vidrock.net/movie/${imdbId}`;
