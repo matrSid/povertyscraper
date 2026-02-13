@@ -36,7 +36,7 @@ async function getBrowser() {
   }
 
   browserInstance = await puppeteer.launch({
-    executablePath: CHROME_PATH,
+
     headless: true,
     args: [
       '--no-sandbox',
